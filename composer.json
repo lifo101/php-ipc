@@ -1,0 +1,20 @@
+{
+    "name": "lifo/php-ipc",
+    "description": "Simple PHP Inter Process Communication (IPC) library",
+    "keywords": ["process", "pool", "ipc", "fork", "thread"],
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Jason Morriss",
+            "email": "lifo2013@gmail.com"
+        }
+    ],
+    "require": {
+        "php": ">=5.3.0",
+        "ext-pcntl": "*"
+    },
+    "autoload": {
+        "psr-0": { "Lifo\\IPC\\": "src/" }
+    }
+}
