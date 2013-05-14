@@ -123,7 +123,6 @@ class ProcessPool
                     // find the worker that matched this socket.
                     foreach ($this->workers as $id => $w) {
                         if ($w['socket'] === $socket) {
-                            echo "Worker #$id is done.\n";
                             unset($this->workers[$id]);
 
                             // kill the child now. This makes the call to
@@ -168,7 +167,7 @@ class ProcessPool
     {
         // add new function to pending queue
         if ($func !== null) {
-            if ($func instanceof \Closure or is_callable($func)) {
+            if ($func instanceof \Closure or $func instanceof ProcessInterface or is_callable($func)) {
                 $this->pending[] = array_merge(array( $func ), array_slice(func_get_args(), 1));
             } else {
                 throw new \UnexpectedValueException("Parameter 1 in ProcessPool#apply must be a Closure or callable");
@@ -221,7 +220,11 @@ class ProcessPool
             socket_close($child);
             try {
                 $args = array_slice(func_get_args(), 1);
-                $result = call_user_func_array($func, $args);
+                if ($func instanceof ProcessInterface) {
+                    $result = $func->run();
+                } else {
+                    $result = call_user_func_array($func, $args);
+                }
                 self::socket_write($parent, $result);
             } catch (\Exception $e) {
                 // nop
