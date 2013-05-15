@@ -83,7 +83,7 @@ class ProcessPool
             }
 
             // timed out?
-            if ($timeout > 0 and microtime(true) - $startTime > $timeout) {
+            if ($timeout and microtime(true) - $startTime > $timeout) {
                 return null;
             }
         }
@@ -148,13 +148,45 @@ class ProcessPool
             }
 
             // timed out?
-            if ($timeout > 0 and microtime(true) - $startTime > $timeout) {
+            if ($timeout and microtime(true) - $startTime > $timeout) {
                 if ($nullOnTimeout) {
                     return null;
                 }
                 throw new \Exception("ProcessPool Timeout");
             }
         }
+    }
+
+    /**
+     * Return results from all workers.
+     *
+     * Does not return until all pending workers are complete or the $timeout
+     * is reached.
+     *
+     * @param integer $timeout Timeout in microseconds if no results are available.
+     * @return array Returns an array of results
+     * @throws \Exception On timeout if $nullOnTimeout is false
+     */
+    public function getAll($timeout = 0, $nullOnTimeout = false)
+    {
+        $results = array();
+        $startTime = microtime(true);
+        while ($this->getPending()) {
+            try {
+                $results[] = $this->get($timeout);
+            } catch (\Exception $e) {
+                // timed out
+            }
+
+            // timed out?
+            if ($timeout and microtime(true) - $startTime > $timeout) {
+                if ($nullOnTimeout) {
+                    return null;
+                }
+                throw new \Exception("ProcessPool Timeout");
+            }
+        }
+        return $results;
     }
 
     /**
