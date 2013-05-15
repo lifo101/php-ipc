@@ -40,15 +40,17 @@ namespace Lifo\IPC;
 class ProcessPool
 {
     protected $max;
+    protected $fork;
     protected $pending;
     protected $workers;
     protected $results;
     protected $count;
 
-    public function __construct($max = 1)
+    public function __construct($max = 1, $fork = true)
     {
         $this->count = 0;
         $this->max = $max;
+        $this->fork = $fork;
         $this->results = array();
     }
 
@@ -222,34 +224,51 @@ class ProcessPool
      */
     protected function create($func /*, ...*/)
     {
-        // create a socket pair before forking so our child process can write to the PARENT.
-        $sockets = array();
-        $domain = strtoupper(substr(PHP_OS, 0, 3)) == 'WIN' ? AF_INET : AF_UNIX;
-        if (socket_create_pair($domain, SOCK_STREAM, 0, $sockets) === false) {
-            throw new \RuntimeException("socket_create_pair failed: " . socket_strerror(socket_last_error()));
-        }
-        list($child, $parent) = $sockets; // just to make the code below more readable
-        unset($sockets);
+        if ($this->fork) {
+            // create a socket pair before forking so our child process can write to the PARENT.
+            $sockets = array();
+            $domain = strtoupper(substr(PHP_OS, 0, 3)) == 'WIN' ? AF_INET : AF_UNIX;
+            if (socket_create_pair($domain, SOCK_STREAM, 0, $sockets) === false) {
+                throw new \RuntimeException("socket_create_pair failed: " . socket_strerror(socket_last_error()));
+            }
+            list($child, $parent) = $sockets; // just to make the code below more readable
+            unset($sockets);
 
-        $time = microtime(true);
+            $time = microtime(true);
 
-        // fork it good!
-        $pid = pcntl_fork();
-        if ($pid == -1) {
-            throw new \RuntimeException("Could not fork");
-        }
+            // fork it good!
+            $pid = pcntl_fork();
+            if ($pid == -1) {
+                throw new \RuntimeException("Could not fork");
+            }
 
-        if ($pid > 0) {
-            // PARENT PROCESS; Just track the child and return
-            socket_close($parent);
-            $this->workers[$pid] = array(
-                'pid' => $pid,
-                'time' => $time,
-                'socket' => $child,
-            );
+            if ($pid > 0) {
+                // PARENT PROCESS; Just track the child and return
+                socket_close($parent);
+                $this->workers[$pid] = array(
+                    'pid' => $pid,
+                    'time' => $time,
+                    'socket' => $child,
+                );
+            } else {
+                // CHILD PROCESS; execute the callback function and wait for response
+                socket_close($child);
+                try {
+                    $args = array_slice(func_get_args(), 1);
+                    if ($func instanceof ProcessInterface) {
+                        $result = $func->run();
+                    } else {
+                        $result = call_user_func_array($func, $args);
+                    }
+                    self::socket_write($parent, $result);
+                } catch (\Exception $e) {
+                    // nop
+                }
+                exit(0);    // child is done
+            }
         } else {
-            // CHILD PROCESS; execute the callback function and wait for response
-            socket_close($child);
+            // forking is disabled so we simply run the child worker and wait
+            // synchronously for response.
             try {
                 $args = array_slice(func_get_args(), 1);
                 if ($func instanceof ProcessInterface) {
@@ -257,11 +276,10 @@ class ProcessPool
                 } else {
                     $result = call_user_func_array($func, $args);
                 }
-                self::socket_write($parent, $result);
+                $this->results[] = $result;
             } catch (\Exception $e) {
                 // nop
             }
-            exit(0);    // child is done
         }
     }
 
@@ -289,6 +307,12 @@ class ProcessPool
     public function getCompleted()
     {
         return $this->count;
+    }
+
+    public function setForking($fork)
+    {
+        $this->fork = $fork;
+        return $this;
     }
 
     public function setMax($max)
