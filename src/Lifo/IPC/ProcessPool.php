@@ -219,8 +219,11 @@ class ProcessPool
     /**
      * Create a new worker.
      *
+     * If forking is disabled this will BLOCK.
+     *
      * @param Closure $func Callback function.
      * @param mixed Any extra parameters are passed to the callback function.
+     * @throws \RuntimeException if the child can not be created.
      */
     protected function create($func /*, ...*/)
     {
@@ -262,7 +265,9 @@ class ProcessPool
                     }
                     self::socket_write($parent, $result);
                 } catch (\Exception $e) {
-                    // nop
+                    // this is kind of useless in a forking context but at
+                    // least the developer can see the exception if it occurs.
+                    throw $e;
                 }
                 exit(0);    // child is done
             }
@@ -278,7 +283,8 @@ class ProcessPool
                 }
                 $this->results[] = $result;
             } catch (\Exception $e) {
-                // nop
+                // nop; we didn't fork so let the caller handle it
+                throw $e;
             }
         }
     }
@@ -346,7 +352,7 @@ class ProcessPool
      * Blocking.
      *
      */
-    protected static function socket_read($fd, $timeout = 0)
+    protected static function socket_read($fd)
     {
         // read 4 byte length first
         $hdr = socket_read($fd, 4);
