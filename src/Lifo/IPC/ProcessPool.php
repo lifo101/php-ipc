@@ -60,7 +60,7 @@ class ProcessPool
      * @param integer $timeout Timeout to wait (microseconds)
      * @return array|null Returns array of sockets ready to be READ or null
      */
-    public function wait($timeout = 0)
+    public function wait($timeout = null)
     {
         //if ($timeout !== null and (!is_numeric($timeout) or $timeout < 0)) {
         //    throw new \InvalidArgumentException("Invalid timeout value: Must be a positive integer");
@@ -100,7 +100,7 @@ class ProcessPool
      * @return mixed Returns next child response or null on timeout
      * @throws \Exception On timeout if $nullOnTimeout is false
      */
-    public function get($timeout = 0, $nullOnTimeout = false)
+    public function get($timeout = null, $nullOnTimeout = false)
     {
         // if we have no possible means of fetching a result then return
         if (empty($this->workers) and empty($this->results) and empty($this->pending)) {
@@ -169,7 +169,7 @@ class ProcessPool
      * @return array Returns an array of results
      * @throws \Exception On timeout if $nullOnTimeout is false
      */
-    public function getAll($timeout = 0, $nullOnTimeout = false)
+    public function getAll($timeout = null, $nullOnTimeout = false)
     {
         $results = array();
         $startTime = microtime(true);
