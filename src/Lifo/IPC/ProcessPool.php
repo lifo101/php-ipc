@@ -160,10 +160,6 @@ class ProcessPool
      */
     public function wait($timeout = null)
     {
-        //if ($timeout !== null and (!is_numeric($timeout) or $timeout < 0)) {
-        //    throw new \InvalidArgumentException("Invalid timeout value: Must be a positive integer");
-        //}
-
         // no sense in waiting if we have no workers and no more pending
         if (empty($this->workers) and empty($this->pending)) {
             return false;
@@ -176,7 +172,7 @@ class ProcessPool
 
             // check each child socket pair for a new result
             $read = array_map(function($w){ return $w['socket']; }, $this->workers);
-            // it's possible for all no workers to be present due to REAPING
+            // it's possible for no workers to be present due to REAPING
             if (empty($read)) {
                 return null;
             }
@@ -371,12 +367,28 @@ class ProcessPool
             try {
                 $args = array_merge(array($parent), array_slice(func_get_args(), 1));
                 if ($func instanceof ProcessInterface) {
-                    //$result = $func->run();
                     $result = call_user_func_array(array($func, 'run'), $args);
                 } else {
                     $result = call_user_func_array($func, $args);
                 }
-                $this->results[] = $result;
+                if ($result !== null) {
+                    $this->results[] = $result;
+                }
+
+                // read anything pending from the worker if they chose to write
+                // to the socket instead of just returning a value.
+                $x = null;
+                do {
+                    $read = array($child);
+                    $ok = socket_select($read, $x, $x, 0);
+                    if ($ok !== false and $ok > 0) {
+                        $res = self::socket_fetch($read[0]);
+                        if ($res !== null) {
+                            $this->results[] = $res;
+                        }
+                    }
+                } while ($ok);
+
             } catch (\Exception $e) {
                 // nop; we didn't fork so let the caller handle it
                 throw $e;
