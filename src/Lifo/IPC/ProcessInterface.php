@@ -19,5 +19,5 @@ interface ProcessInterface
      * Method representing the process’s activity which is run in its own
      * child process.
      */
-    public function run();
+    public function run($parent);
 }

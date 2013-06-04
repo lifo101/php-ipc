@@ -79,12 +79,12 @@ class ProcessPool
 
     public function __construct($max = 1, $fork = true)
     {
-        $pid = getmypid();
-        if (isset(self::$instance[$pid])) {
-            $caller = debug_backtrace();
-            throw new ProcessPoolException("Cannot instantiate more than 1 ProcessPool in the same process in {$caller[0]['file']} line {$caller[0]['line']}");
-        }
-        self::$instance[$pid] = $this;
+        //$pid = getmypid();
+        //if (isset(self::$instance[$pid])) {
+        //    $caller = debug_backtrace();
+        //    throw new ProcessPoolException("Cannot instantiate more than 1 ProcessPool in the same process in {$caller[0]['file']} line {$caller[0]['line']}");
+        //}
+        //self::$instance[$pid] = $this;
         $this->count = 0;
         $this->max = $max;
         $this->fork = $fork;
@@ -99,7 +99,7 @@ class ProcessPool
     {
         // make sure signal handler is removed
         $this->uninit();
-        unset(self::$instance[getmygid()]);
+        //unset(self::$instance[getmygid()]);
     }
 
     /**
