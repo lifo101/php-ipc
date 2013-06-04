@@ -9,18 +9,27 @@
  */
 namespace Lifo\IPC;
 
+declare(ticks = 1);
+
 /**
  * A simple Process Pool manager for managing a list of forked processes.
  * API Inspired by the Python multiprocessing library.
  *
  * Each "process" is a function that is called via a forked child. A child
- * may return any serializable result back to the parent.
+ * may send any serializable result back to the parent or can use
+ * ProcessPool::socket_send() to send multiple serializable results to the
+ * $parent socket.
+ *
+ * Only 1 ProcessPool per process can be active at a time due to the signal
+ * handler for SIGCHLD. IF you attempt to start a second pool within the same
+ * process the second instance will override the SIGCHLD handler and the
+ * previous ProcessPool will not reap its children properly.
  *
  * @example
     $pool = new ProcessPool(16);
     for ($i=0; $i<100; $i++) {
-        $pool->apply(function() use ($i, $output) {
-            $output->writeln("$i running...");
+        $pool->apply(function($parent) use ($i) {
+            echo "$i running...\n";
             mt_srand(); // must re-seed for each child
             $rand = mt_rand(1000000, 2000000);
             usleep($rand);
@@ -31,7 +40,7 @@ namespace Lifo\IPC;
         try {
             $result = $pool->get(1000000); // timeout in 1 second
             echo "GOT: ", $result, "\n";
-        } catch (Exception $e) {
+        } catch (ProcessPoolException $e) {
             // timeout
         }
     }
@@ -39,19 +48,108 @@ namespace Lifo\IPC;
  */
 class ProcessPool
 {
+    /** @var Integer Maximum workers allowed at once */
     protected $max;
+
+    /** @var boolean If true workers will fork. Otherwise they will run synchronously */
     protected $fork;
-    protected $pending;
-    protected $workers;
-    protected $results;
+
+    /** @var Integer Total results collected */
     protected $count;
+
+    /** @var array Pending processes that have not been started yet */
+    protected $pending;
+
+    /** @var array Processes that have been started */
+    protected $workers;
+
+    /** @var array Results that have been collected */
+    protected $results;
+
+    /** @var \Closure Function to call every time a child is forked */
+    protected $createCallback;
+
+    /** @var array children PID's that died prematurely */
+    private   $caught;
+
+    /** @var boolean Is the signal handler initialized? */
+    private   $initialized;
+
+    private static $instance = array();
 
     public function __construct($max = 1, $fork = true)
     {
+        $pid = getmypid();
+        if (isset(self::$instance[$pid])) {
+            $caller = debug_backtrace();
+            throw new ProcessPoolException("Cannot instantiate more than 1 ProcessPool in the same process in {$caller[0]['file']} line {$caller[0]['line']}");
+        }
+        self::$instance[$pid] = $this;
         $this->count = 0;
         $this->max = $max;
         $this->fork = $fork;
         $this->results = array();
+        $this->workers = array();
+        $this->pending = array();
+        $this->caught = array();
+        $this->initialized = false;
+    }
+
+    public function __destruct()
+    {
+        // make sure signal handler is removed
+        $this->uninit();
+        unset(self::$instance[getmygid()]);
+    }
+
+    /**
+     * Initialize the signal handler.
+     *
+     * Note: This will replace any current handler for SIGCHLD.
+     *
+     * @param boolean $force Force initialization even if already initialized
+     */
+    private function init($force = false)
+    {
+        if ($this->initialized and !$force) {
+            return;
+        }
+        $this->initialized = true;
+        pcntl_signal(SIGCHLD, array($this, 'reaper'));
+    }
+
+    private function uninit()
+    {
+        if (!$this->initialized) {
+            return;
+        }
+        $this->initialized = false;
+        pcntl_signal(SIGCHLD, SIG_DFL);
+    }
+
+    /**
+     * Reap any dead children
+     */
+    public function reaper($signo, $pid = null, $status = null)
+    {
+        if ($pid === null) {
+            $pid = pcntl_waitpid(-1, $status, WNOHANG);
+        }
+
+        while ($pid > 0) {
+            //$exitCode = pcntl_wexitstatus($status);
+            if (isset($this->workers[$pid])) {
+                // @todo does the socket really need to be closed?
+                //@socket_close($this->workers[$pid]['socket']);
+                unset($this->workers[$pid]);
+            } else {
+                // the child died before the parent could initialize the $worker
+                // queue. So we track it temporarily so we can handle it in
+                // self::create().
+                $this->caught[$pid] = $status;
+            }
+            $pid = pcntl_waitpid(-1, $status, WNOHANG);
+        }
     }
 
     /**
@@ -78,6 +176,10 @@ class ProcessPool
 
             // check each child socket pair for a new result
             $read = array_map(function($w){ return $w['socket']; }, $this->workers);
+            // it's possible for all no workers to be present due to REAPING
+            if (empty($read)) {
+                return null;
+            }
             $ok = socket_select($read, $x, $x, $timeout);
 
             if ($ok !== false and $ok > 0) {
@@ -98,55 +200,31 @@ class ProcessPool
      *
      * @param integer $timeout Timeout in microseconds if no results are available.
      * @return mixed Returns next child response or null on timeout
-     * @throws \Exception On timeout if $nullOnTimeout is false
+     * @throws ProcessPoolException On timeout if $nullOnTimeout is false
      */
     public function get($timeout = null, $nullOnTimeout = false)
     {
-        // if we have no possible means of fetching a result then return
-        if (empty($this->workers) and empty($this->results) and empty($this->pending)) {
-            return false;
-        }
-
         // return the next result; if already available
         if (!empty($this->results)) {
             return array_shift($this->results);
         }
 
-        $status = null;
         $startTime = microtime(true);
-        while (true) {
-            $ready = $this->wait($timeout);
-
-            if (is_array($ready)) {
-                foreach ($ready as $socket) {
-                    $this->results[] = self::socket_read($socket);
-                    $this->count++;
-
-                    // find the worker that matched this socket.
-                    foreach ($this->workers as $id => $w) {
-                        if ($w['socket'] === $socket) {
-                            unset($this->workers[$id]);
-
-                            // kill the child now. This makes the call to
-                            // pcntl_waitpid much faster.
-                            // @todo make this configurable; what if we don't
-                            //       want children to exit immediately after a
-                            //       result?
-                            posix_kill($w['pid'], SIGINT);
-
-                            // wait for child to exit (avoid "defunct" processes)
-                            //pcntl_waitpid($w['pid'], $status, WUNTRACED);
-                            pcntl_waitpid(-1, $status, WUNTRACED);
-
-                            break;
-                        }
-                    }
-                }
-            }
-
+        while ($this->getPending()) {
             // return the next result
             if (!empty($this->results)) {
                 return array_shift($this->results);
+            }
+
+            $ready = $this->wait($timeout);
+            if (is_array($ready)) {
+                foreach ($ready as $socket) {
+                    $res = self::socket_fetch($socket);
+                    if ($res !== null) {
+                        $this->results[] = $res;
+                        $this->count++;
+                    }
+                }
             }
 
             // timed out?
@@ -154,7 +232,7 @@ class ProcessPool
                 if ($nullOnTimeout) {
                     return null;
                 }
-                throw new \Exception("ProcessPool Timeout");
+                throw new ProcessPoolException("Timeout");
             }
         }
     }
@@ -167,7 +245,7 @@ class ProcessPool
      *
      * @param integer $timeout Timeout in microseconds if no results are available.
      * @return array Returns an array of results
-     * @throws \Exception On timeout if $nullOnTimeout is false
+     * @throws ProcessPoolException On timeout if $nullOnTimeout is false
      */
     public function getAll($timeout = null, $nullOnTimeout = false)
     {
@@ -176,7 +254,7 @@ class ProcessPool
         while ($this->getPending()) {
             try {
                 $results[] = $this->get($timeout);
-            } catch (\Exception $e) {
+            } catch (ProcessPoolException $e) {
                 // timed out
             }
 
@@ -185,7 +263,7 @@ class ProcessPool
                 if ($nullOnTimeout) {
                     return null;
                 }
-                throw new \Exception("ProcessPool Timeout");
+                throw new ProcessPoolException("Timeout");
             }
         }
         return $results;
@@ -223,23 +301,24 @@ class ProcessPool
      *
      * @param Closure $func Callback function.
      * @param mixed Any extra parameters are passed to the callback function.
-     * @throws \RuntimeException if the child can not be created.
+     * @throws \RuntimeException if the child can not be forked.
      */
     protected function create($func /*, ...*/)
     {
+        // create a socket pair before forking so our child process can write to the PARENT.
+        $sockets = array();
+        $domain = strtoupper(substr(PHP_OS, 0, 3)) == 'WIN' ? AF_INET : AF_UNIX;
+        if (socket_create_pair($domain, SOCK_STREAM, 0, $sockets) === false) {
+            throw new \RuntimeException("socket_create_pair failed: " . socket_strerror(socket_last_error()));
+        }
+        list($child, $parent) = $sockets; // just to make the code below more readable
+        unset($sockets);
+
+        $args = array_merge(array($parent), array_slice(func_get_args(), 1));
+
+        $this->init();                  // make sure signal handler is installed
+
         if ($this->fork) {
-            // create a socket pair before forking so our child process can write to the PARENT.
-            $sockets = array();
-            $domain = strtoupper(substr(PHP_OS, 0, 3)) == 'WIN' ? AF_INET : AF_UNIX;
-            if (socket_create_pair($domain, SOCK_STREAM, 0, $sockets) === false) {
-                throw new \RuntimeException("socket_create_pair failed: " . socket_strerror(socket_last_error()));
-            }
-            list($child, $parent) = $sockets; // just to make the code below more readable
-            unset($sockets);
-
-            $time = microtime(true);
-
-            // fork it good!
             $pid = pcntl_fork();
             if ($pid == -1) {
                 throw new \RuntimeException("Could not fork");
@@ -250,34 +329,50 @@ class ProcessPool
                 socket_close($parent);
                 $this->workers[$pid] = array(
                     'pid' => $pid,
-                    'time' => $time,
                     'socket' => $child,
                 );
+                // don't pass $parent to callback
+                $this->doOnCreate(array_slice($args, 1));
+
+                // If a SIGCHLD was already caught at this point we need to
+                // manually handle it to avoid a defunct process.
+                if (isset($this->caught[$pid])) {
+                    $this->reaper(SIGCHLD, $pid, $this->caught[$pid]);
+                    unset($this->caught[$pid]);
+                }
             } else {
                 // CHILD PROCESS; execute the callback function and wait for response
                 socket_close($child);
                 try {
-                    $args = array_slice(func_get_args(), 1);
                     if ($func instanceof ProcessInterface) {
-                        $result = $func->run();
+                        $result = call_user_func_array(array($func, 'run'), $args);
                     } else {
                         $result = call_user_func_array($func, $args);
                     }
-                    self::socket_write($parent, $result);
+                    if ($result !== null) {
+                        self::socket_send($parent, $result);
+                    }
                 } catch (\Exception $e) {
                     // this is kind of useless in a forking context but at
                     // least the developer can see the exception if it occurs.
                     throw $e;
                 }
-                exit(0);    // child is done
+                // @todo Is this really wise? By killing the child we prevent
+                // it was closing any shared resources (like DB connections)
+                // which can cause problems in the parent. But I have not
+                // personally tested this to see how well it works or what its
+                // side effects might be with a lot of short-lived processes.
+                //posix_kill(getmypid(),9);
+                exit(0);
             }
         } else {
             // forking is disabled so we simply run the child worker and wait
             // synchronously for response.
             try {
-                $args = array_slice(func_get_args(), 1);
+                $args = array_merge(array($parent), array_slice(func_get_args(), 1));
                 if ($func instanceof ProcessInterface) {
-                    $result = $func->run();
+                    //$result = $func->run();
+                    $result = call_user_func_array(array($func, 'run'), $args);
                 } else {
                     $result = call_user_func_array($func, $args);
                 }
@@ -286,6 +381,27 @@ class ProcessPool
                 // nop; we didn't fork so let the caller handle it
                 throw $e;
             }
+        }
+    }
+
+    /**
+     * Set a callback when a new forked process is created. This will allow the
+     * parent to perform some sort of cleanup after every child is created.
+     *
+     * This is useful to reinitialize certain resources like DB connections
+     * since children will inherit the parent resources.
+     *
+     * @param \Closure $callback Function to callback after every forked child.
+     */
+    public function setOnCreate(\Closure $callback = null)
+    {
+        $this->createCallback = $callback;
+    }
+
+    protected function doOnCreate($args = array())
+    {
+        if ($this->createCallback) {
+            call_user_func_array($this->createCallback, $args);
         }
     }
 
@@ -338,7 +454,7 @@ class ProcessPool
     /**
      * Write the data to the socket in a predetermined format
      */
-    protected static function socket_write($fd, $data)
+    public static function socket_send($fd, $data)
     {
         $serialized = serialize($data);
         $len = strlen($serialized);
@@ -352,7 +468,7 @@ class ProcessPool
      * Blocking.
      *
      */
-    protected static function socket_read($fd)
+    public static function socket_fetch($fd)
     {
         // read 4 byte length first
         $hdr = socket_read($fd, 4);
