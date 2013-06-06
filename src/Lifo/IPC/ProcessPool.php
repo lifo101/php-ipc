@@ -38,7 +38,7 @@ declare(ticks = 1);
     }
     while ($pool->getPending()) {
         try {
-            $result = $pool->get(1000000); // timeout in 1 second
+            $result = $pool->get(1);    // timeout in 1 second
             echo "GOT: ", $result, "\n";
         } catch (ProcessPoolException $e) {
             // timeout
@@ -115,7 +115,7 @@ class ProcessPool
             return;
         }
         $this->initialized = true;
-        pcntl_signal(SIGCHLD, array($this, 'reaper'));
+        pcntl_signal(SIGCHLD, array($this, 'signalHandler'));
     }
 
     private function uninit()
@@ -127,17 +127,25 @@ class ProcessPool
         pcntl_signal(SIGCHLD, SIG_DFL);
     }
 
+    public function signalHandler($signo)
+    {
+        switch ($signo) {
+            case SIGCHLD:
+                $this->reaper();
+                break;
+        }
+    }
+
     /**
      * Reap any dead children
      */
-    public function reaper($signo, $pid = null, $status = null)
+    public function reaper($pid = null, $status = null)
     {
         if ($pid === null) {
             $pid = pcntl_waitpid(-1, $status, WNOHANG);
         }
 
         while ($pid > 0) {
-            //$exitCode = pcntl_wexitstatus($status);
             if (isset($this->workers[$pid])) {
                 // @todo does the socket really need to be closed?
                 //@socket_close($this->workers[$pid]['socket']);
@@ -155,16 +163,11 @@ class ProcessPool
     /**
      * Wait for any child to be ready
      *
-     * @param integer $timeout Timeout to wait (microseconds)
+     * @param integer $timeout Timeout to wait (fractional seconds)
      * @return array|null Returns array of sockets ready to be READ or null
      */
     public function wait($timeout = null)
     {
-        // no sense in waiting if we have no workers and no more pending
-        if (empty($this->workers) and empty($this->pending)) {
-            return false;
-        }
-
         $x = null;                      // trash var needed for socket_select
         $startTime = microtime(true);
         while (true) {
@@ -172,18 +175,21 @@ class ProcessPool
 
             // check each child socket pair for a new result
             $read = array_map(function($w){ return $w['socket']; }, $this->workers);
-            // it's possible for no workers to be present due to REAPING
-            if (empty($read)) {
-                return null;
-            }
-            $ok = socket_select($read, $x, $x, $timeout);
-
-            if ($ok !== false and $ok > 0) {
-                return $read;
+            // it's possible for no workers/sockets to be present due to REAPING
+            if (!empty($read)) {
+                $ok = socket_select($read, $x, $x, $timeout);
+                if ($ok !== false and $ok > 0) {
+                    return $read;
+                }
             }
 
             // timed out?
             if ($timeout and microtime(true) - $startTime > $timeout) {
+                return null;
+            }
+
+            // no sense in waiting if we have no workers and no more pending
+            if (empty($this->workers) and empty($this->pending)) {
                 return null;
             }
         }
@@ -194,24 +200,20 @@ class ProcessPool
      *
      * Blocks unless a $timeout is specified.
      *
-     * @param integer $timeout Timeout in microseconds if no results are available.
+     * @param integer $timeout Timeout in fractional seconds if no results are available.
      * @return mixed Returns next child response or null on timeout
      * @throws ProcessPoolException On timeout if $nullOnTimeout is false
      */
     public function get($timeout = null, $nullOnTimeout = false)
     {
-        // return the next result; if already available
-        if (!empty($this->results)) {
-            return array_shift($this->results);
-        }
-
         $startTime = microtime(true);
         while ($this->getPending()) {
             // return the next result
-            if (!empty($this->results)) {
-                return array_shift($this->results);
+            if ($this->hasResult()) {
+                return $this->getResult();
             }
 
+            // wait for the next result
             $ready = $this->wait($timeout);
             if (is_array($ready)) {
                 foreach ($ready as $socket) {
@@ -220,6 +222,9 @@ class ProcessPool
                         $this->results[] = $res;
                         $this->count++;
                     }
+                }
+                if ($this->hasResult()) {
+                    return $this->getResult();
                 }
             }
 
@@ -239,7 +244,7 @@ class ProcessPool
      * Does not return until all pending workers are complete or the $timeout
      * is reached.
      *
-     * @param integer $timeout Timeout in microseconds if no results are available.
+     * @param integer $timeout Timeout in fractional seconds if no results are available.
      * @return array Returns an array of results
      * @throws ProcessPoolException On timeout if $nullOnTimeout is false
      */
@@ -249,7 +254,10 @@ class ProcessPool
         $startTime = microtime(true);
         while ($this->getPending()) {
             try {
-                $results[] = $this->get($timeout);
+                $res = $this->get($timeout);
+                if ($res !== null) {
+                    $results[] = $res;
+                }
             } catch (ProcessPoolException $e) {
                 // timed out
             }
@@ -265,6 +273,24 @@ class ProcessPool
         return $results;
     }
 
+    public function hasResult()
+    {
+        return !empty($this->results);
+    }
+
+    /**
+     * Return the next available result or null if none are available.
+     *
+     * This does not wait or manage the worker queue.
+     */
+    public function getResult()
+    {
+        if (empty($this->results)) {
+            return null;
+        }
+        return array_shift($this->results);
+    }
+
     /**
      * Apply a worker to the working or pending queue
      *
@@ -276,7 +302,7 @@ class ProcessPool
         // add new function to pending queue
         if ($func !== null) {
             if ($func instanceof \Closure or $func instanceof ProcessInterface or is_callable($func)) {
-                $this->pending[] = array_merge(array( $func ), array_slice(func_get_args(), 1));
+                $this->pending[] = func_get_args();
             } else {
                 throw new \UnexpectedValueException("Parameter 1 in ProcessPool#apply must be a Closure or callable");
             }
@@ -333,7 +359,7 @@ class ProcessPool
                 // If a SIGCHLD was already caught at this point we need to
                 // manually handle it to avoid a defunct process.
                 if (isset($this->caught[$pid])) {
-                    $this->reaper(SIGCHLD, $pid, $this->caught[$pid]);
+                    $this->reaper($pid, $this->caught[$pid]);
                     unset($this->caught[$pid]);
                 }
             } else {
@@ -353,26 +379,20 @@ class ProcessPool
                     // least the developer can see the exception if it occurs.
                     throw $e;
                 }
-                // @todo Is this really wise? By killing the child we prevent
-                // it was closing any shared resources (like DB connections)
-                // which can cause problems in the parent. But I have not
-                // personally tested this to see how well it works or what its
-                // side effects might be with a lot of short-lived processes.
-                //posix_kill(getmypid(),9);
                 exit(0);
             }
         } else {
             // forking is disabled so we simply run the child worker and wait
             // synchronously for response.
             try {
-                $args = array_merge(array($parent), array_slice(func_get_args(), 1));
                 if ($func instanceof ProcessInterface) {
                     $result = call_user_func_array(array($func, 'run'), $args);
                 } else {
                     $result = call_user_func_array($func, $args);
                 }
                 if ($result !== null) {
-                    $this->results[] = $result;
+                    //$this->results[] = $result;
+                    self::socket_send($parent, $result);
                 }
 
                 // read anything pending from the worker if they chose to write
@@ -394,6 +414,35 @@ class ProcessPool
                 throw $e;
             }
         }
+    }
+
+    /**
+     * Clear all pending workers from the queue.
+     */
+    public function clear()
+    {
+        $this->pending = array();
+        return $this;
+    }
+
+    /**
+     * Send a SIGTERM (or other) signal to the PID given
+     */
+    public function kill($pid, $signo = SIGTERM)
+    {
+        posix_kill($pid, $signo);
+        return $this;
+    }
+
+    /**
+     * Send a SIGTERM (or other) signal to all current workers
+     */
+    public function killAll($signo = SIGTERM)
+    {
+        foreach ($this->workers as $w) {
+            $this->kill($w['pid'], $signo);
+        }
+        return $this;
     }
 
     /**
@@ -466,12 +515,25 @@ class ProcessPool
     /**
      * Write the data to the socket in a predetermined format
      */
-    public static function socket_send($fd, $data)
+    public static function socket_send($socket, $data)
     {
         $serialized = serialize($data);
-        $len = strlen($serialized);
-        $hdr = pack('N', $len);    // 4 byte length
-        return socket_write($fd, $hdr . $serialized);
+        $hdr = pack('N', strlen($serialized));    // 4 byte length
+        $buffer = $hdr . $serialized;
+        $total = strlen($buffer);
+        while (true) {
+            $sent = socket_write($socket, $buffer);
+            if ($sent === false) {
+                // @todo handle error?
+                //$error = socket_strerror(socket_last_error());
+                break;
+            }
+            if ($sent >= $total) {
+                break;
+            }
+            $total -= $sent;
+            $buffer = substr($buffer, $sent);
+        }
     }
 
     /**
@@ -480,20 +542,29 @@ class ProcessPool
      * Blocking.
      *
      */
-    public static function socket_fetch($fd)
+    public static function socket_fetch($socket)
     {
         // read 4 byte length first
-        $hdr = socket_read($fd, 4);
-        if ($hdr === false or $hdr === '') {
-            return null;
-        }
+        $hdr = '';
+        do {
+            $read = socket_read($socket, 4 - strlen($hdr));
+            if ($read === false or $read === '') {
+                return null;
+            }
+            $hdr .= $read;
+        } while (strlen($hdr) < 4);
+
         list($len) = array_values(unpack("N", $hdr));
 
         // read the full buffer
-        $buffer = socket_read($fd, $len);
-        if ($buffer === false or $buffer == '') {
-            return null;
-        }
+        $buffer = '';
+        do {
+            $read = socket_read($socket, $len - strlen($buffer));
+            if ($read === false or $read == '') {
+                return null;
+            }
+            $buffer .= $read;
+        } while (strlen($buffer) < $len);
 
         $data = unserialize($buffer);
         return $data;

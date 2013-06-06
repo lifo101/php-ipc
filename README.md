@@ -42,7 +42,7 @@ for ($i=0; $i<100; $i++) {
 // wait for all results to be finished ...
 while ($pool->getPending()) {
     try {
-        $result = $pool->get(1000000); // timeout in 1 second
+        $result = $pool->get(1); // timeout in 1 second
         echo "GOT: ", $result, "\n";
     } catch (\Exception $e) {
         // timeout
@@ -77,6 +77,8 @@ $pool->apply(function($parent) use (&$db) {
     // after we were created (our $db handle is not equal to the parent $db)
     // ...
 });
+
+$results = $pool->getAll();
 ```
 
   [serialize]: http://php.net/serialize
