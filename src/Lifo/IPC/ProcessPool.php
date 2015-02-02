@@ -177,7 +177,7 @@ class ProcessPool
             $read = array_map(function($w){ return $w['socket']; }, $this->workers);
             // it's possible for no workers/sockets to be present due to REAPING
             if (!empty($read)) {
-                $ok = socket_select($read, $x, $x, $timeout);
+                $ok = @socket_select($read, $x, $x, $timeout);
                 if ($ok !== false and $ok > 0) {
                     return $read;
                 }
