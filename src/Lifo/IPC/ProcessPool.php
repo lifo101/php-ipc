@@ -111,7 +111,7 @@ class ProcessPool
      */
     private function init($force = false)
     {
-        if ($this->initialized and !$force) {
+        if (!function_exists('pcntl_signal') || ($this->initialized && !$force)) {
             return;
         }
         $this->initialized = true;
@@ -120,7 +120,7 @@ class ProcessPool
 
     private function uninit()
     {
-        if (!$this->initialized) {
+        if (!function_exists('pcntl_signal') || !$this->initialized) {
             return;
         }
         $this->initialized = false;
@@ -340,7 +340,7 @@ class ProcessPool
 
         $this->init();                  // make sure signal handler is installed
 
-        if ($this->fork) {
+        if ($this->fork && function_exists('pcntl_fork')) {
             $pid = pcntl_fork();
             if ($pid == -1) {
                 throw new \RuntimeException("Could not fork");
