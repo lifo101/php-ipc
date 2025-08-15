@@ -9,7 +9,9 @@
  */
 namespace Lifo\IPC;
 
-class ProcessPoolException extends \Exception
+use Exception;
+
+class ProcessPoolException extends Exception
 {
 
 }

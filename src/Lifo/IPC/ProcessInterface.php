@@ -16,7 +16,7 @@ namespace Lifo\IPC;
 interface ProcessInterface
 {
     /**
-     * Method representing the process’s activity which is run in its own
+     * Method representing the processï¿½s activity which is run in its own
      * child process.
      */
     public function run($parent);
