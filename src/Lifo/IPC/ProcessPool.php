@@ -77,6 +77,10 @@ class ProcessPool
     /** @var Closure|null Function to call every time a child is forked */
     protected ?Closure $createCallback = null;
 
+    protected ?int $sendSize = null;
+
+    protected ?int $recvSize = null;
+
     /** @var array children PID's that died prematurely */
     private array $caught = [];
 
@@ -160,6 +164,28 @@ class ProcessPool
         }
     }
 
+    public function setSendSize(?int $size): static
+    {
+        $this->sendSize = $size;
+        return $this;
+    }
+
+    public function getSendSize(): ?int
+    {
+        return $this->sendSize;
+    }
+
+    public function setRecvSize(?int $size): static
+    {
+        $this->recvSize = $size;
+        return $this;
+    }
+
+    public function getRecvSize(): ?int
+    {
+        return $this->recvSize;
+    }
+
     /**
      * Wait for any child to be ready
      *
@@ -219,6 +245,7 @@ class ProcessPool
             $ready = $this->wait($timeout);
             if (is_array($ready)) {
                 foreach ($ready as $socket) {
+                    $this->applySocketRecvOptions($socket);
                     $res = self::socket_fetch($socket);
                     if ($res !== null) {
                         $this->results[] = $res;
@@ -379,6 +406,7 @@ class ProcessPool
                         $result = call_user_func_array($func, $args);
                     }
                     if ($result !== null) {
+                        $this->applySocketSendOptions($parent);
                         self::socket_send($parent, $result);
                     }
                 } catch (Exception $e) {
@@ -399,6 +427,7 @@ class ProcessPool
                 }
                 if ($result !== null) {
                     //$this->results[] = $result;
+                    $this->applySocketSendOptions($parent);
                     self::socket_send($parent, $result);
                 }
 
@@ -409,6 +438,7 @@ class ProcessPool
                     $read = array($child);
                     $ok = socket_select($read, $x, $x, 0);
                     if ($ok !== false and $ok > 0) {
+                        $this->applySocketRecvOptions($read[0]);
                         $res = self::socket_fetch($read[0]);
                         if ($res !== null) {
                             $this->results[] = $res;
@@ -420,6 +450,20 @@ class ProcessPool
                 // nop; we didn't fork so let the caller handle it
                 throw $e;
             }
+        }
+    }
+
+    protected function applySocketSendOptions($socket): void
+    {
+        if ($this->sendSize) {
+            socket_set_option($socket, SOL_SOCKET, SO_SNDBUF, $this->sendSize);
+        }
+    }
+
+    protected function applySocketRecvOptions($socket): void
+    {
+        if ($this->recvSize) {
+            socket_set_option($socket, SOL_SOCKET, SO_RCVBUF, $this->recvSize);
         }
     }
 
